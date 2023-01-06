@@ -67,8 +67,8 @@ int main()
 {
     setSegmentationParam();
 
-    std::string file_1 = "/home/tony/iterative_closest_point/data/degree_0/front_bottom_6.872629.pcd";
-    std::string file_2 = "/home/tony/iterative_closest_point/data/degree_0/front_bottom_0.000000.pcd";
+    std::string file_2 = "/home/tony/iterative_closest_point/data/front_rear/rear_-179.596790.pcd";
+    std::string file_1 = "/home/tony/iterative_closest_point/data/front_rear/rear_-185.324076.pcd";
 
     pcl::PointCloud<PointType>::Ptr source_cloud(new pcl::PointCloud<PointType>);
     pcl::PointCloud<PointType>::Ptr target_cloud(new pcl::PointCloud<PointType>);
@@ -83,8 +83,12 @@ int main()
     voxelize(source_cloud, *source_cloud,0.03);
     voxelize(target_cloud, *target_cloud,0.03);
 
+
     groundSegmentation(source_cloud,source_cloud);
     groundSegmentation(target_cloud,target_cloud);
+    
+    roiFilter(source_cloud, source_cloud, "z", 0.0, 2.0);
+    roiFilter(target_cloud, target_cloud, "z", 0.0, 2.0);
 
     iterative_closest_point::ICP icp;
     icp.setSourceData(source_cloud);
@@ -100,7 +104,7 @@ int main()
 
 
     icp.computeTransformation();
-    Eigen::Matrix4d tf = icp.getTransformation();
+    Eigen::Matrix4d tf = icp.getFinalTransformation();
     pcl::PointCloud<PointType>::Ptr transformed_cloud (new pcl::PointCloud<PointType>);
     pcl::transformPointCloud(*source_cloud, *transformed_cloud, tf);
 

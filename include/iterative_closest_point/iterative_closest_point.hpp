@@ -25,6 +25,7 @@ public:
         chi_ = 0.0;
         xyz_ =  Eigen::Vector3d::Zero();
         rpy_ =  Eigen::Vector3d::Zero();
+        lm_param = {0.1,true,10.0,0.1,1e-9};
     }
 
     void setEuclidianThreshold(const double &threshold)
@@ -55,118 +56,140 @@ public:
         rpy_ = rpy;
     }
 
-
-
     void computeTransformation()
     {
         pcl::PointCloud<PointT>::Ptr transformed_cloud (new pcl::PointCloud<PointT>);
         *transformed_cloud = *source_cloud_;
+        double prev_err = std::numeric_limits<double>::max();
+        auto xyz = xyz_;
+        auto rpy = rpy_;
         for(std::size_t i=0; i<max_iteration_; i++) {
-            auto tf = getTransformation();
-            Correspondences correspondences = getCorrespondenceIndices(transformed_cloud, target_cloud_);
-            optimize(correspondences);
-            auto dparam = (H_.transpose() * H_).ldlt().solve(H_.transpose() * -g_);
-            rpy_(0)+=dparam(0);
-            rpy_(1)+=dparam(1);
-            rpy_(2)+=dparam(2);
-            xyz_(0)+=dparam(3);
-            xyz_(1)+=dparam(4);
-            xyz_(2)+=dparam(5);
+            double curr_err(0.0);
+            auto tf = getTransformation(xyz, rpy);
             pcl::transformPointCloud(*source_cloud_, *transformed_cloud, tf);
-            std::cout << "iter: " << i << " err: " << chi_ << std::endl;
+            Correspondences correspondences = getCorrespondenceIndices(transformed_cloud, target_cloud_);
+            H_ = Hessian::Zero();
+            g_ = Eigen::Matrix<double, 6, 1>::Zero();
+            chi_ = 0.0;
+            Jacobian J;
+            for(int corr_idx = 0; corr_idx < correspondences.size(); corr_idx++) {
+                int i = correspondences[corr_idx].first;
+                int j = correspondences[corr_idx].second;
+                PointT p_src = source_cloud_->points[i];
+                PointT p_tgt = target_cloud_->points[j];
+
+                Eigen::Vector3d err = getError(xyz, rpy, p_src, p_tgt);
+                double weight = (err.norm() > euclidian_threshold_) ? 0.0 : 1.0;
+                // double weight(1.0);
+                J = getJacobian(rpy_, p_src);
+                H_ += weight*(J.transpose() * J);
+                g_ += weight*(J.transpose() * err);
+                chi_ += weight* err.transpose() * err;
+                curr_err+=weight*err.norm();
+                // std::cout <<err.transpose() * err << ", ";
+            }
+            chi_/=correspondences.size();
+            Hessian H_diag = H_.diagonal().matrix().asDiagonal();
+            auto dparam = -(H_+lm_param.lambda*H_diag).inverse()*g_;
+
+            rpy(0)+=dparam(0);
+            rpy(1)+=dparam(1);
+            rpy(2)+=dparam(2);
+            xyz(0)+=dparam(3);
+            xyz(1)+=dparam(4);
+            xyz(2)+=dparam(5);
+            if (prev_err>chi_) {
+                prev_err = chi_; 
+                lm_param.lambda = lm_param.lambda/lm_param.decrease_factor;
+                rpy_=rpy;
+                xyz_=xyz;
+
+            } else {
+                lm_param.lambda = lm_param.lambda/lm_param.increase_factor;
+            }
+
+            std::cout << "iter: " << i << " err: " << chi_ << " lambda: " << lm_param.lambda << std::endl;
+            if(chi_ < lm_param.tollerance) {
+                std::cout << "converged!" << std::endl;
+            }
         }
         std::cout << "xyz";
         std::cout << xyz_.transpose() << std::endl;
         std::cout << "rpy";
         std::cout << rpy_.transpose() << std::endl;
+
     }
 
-    Eigen::Matrix4d getTransformation()
+    Eigen::Matrix4d getTransformation(const Eigen::Vector3d &xyz, const Eigen::Vector3d &rpy)
     {
         Eigen::Matrix3d rotation;
-        rotation = Eigen::AngleAxisd(rpy_(2), Eigen::Vector3d::UnitZ())
-                  * Eigen::AngleAxisd(rpy_(1), Eigen::Vector3d::UnitY())
-                  * Eigen::AngleAxisd(rpy_(0), Eigen::Vector3d::UnitX());
-        Eigen::Translation3d translation (xyz_(0),xyz_(1),xyz_(2));
+        rotation = Eigen::AngleAxisd(rpy(2), Eigen::Vector3d::UnitZ())
+                  * Eigen::AngleAxisd(rpy(1), Eigen::Vector3d::UnitY())
+                  * Eigen::AngleAxisd(rpy(0), Eigen::Vector3d::UnitX());
+        Eigen::Translation3d translation (xyz(0),xyz(1),xyz(2));
         Eigen::Matrix4d tf = (translation * rotation).matrix ();
         return tf;
     }
 
-    void optimize(const Correspondences &correspondences)
+    Eigen::Matrix4d getFinalTransformation()
     {
-        H_ = Hessian::Zero();
-        g_ = Eigen::Matrix<double, 6, 1>::Zero();
-        chi_ = 0.0;
-        double J_sum(0.0);
-        double final_err;
-        for(int corr_idx = 0; corr_idx < correspondences.size(); corr_idx++) {
-            int i = correspondences[corr_idx].first;
-            int j = correspondences[corr_idx].second;
-            PointT p_src = source_cloud_->points[i];
-            PointT p_tgt = target_cloud_->points[j];
-
-            Eigen::Vector3d err = getError(p_src, p_tgt);
-            double weight = (err.norm() > euclidian_threshold_) ? 0.0 : 1.0;
-            // double weight(1.0);
-            Jacobian J = getJacobian(p_src);
-            J_sum+=J.norm();
-            H_ += weight*(J.transpose() * J);
-            g_ += weight*(J.transpose() * err);
-            chi_ += weight* err.transpose() * err;
-            final_err = err.norm();
-            // std::cout <<err.transpose() * err << ", ";
-        }
-
-        std::cout << J_sum<<  std::endl;
+        return getTransformation(xyz_, rpy_);
     }
+
 protected:
 
     pcl::PointCloud<PointT>::Ptr source_cloud_;
     pcl::PointCloud<PointT>::Ptr target_cloud_;
     Eigen::Vector3d xyz_;
     Eigen::Vector3d rpy_;
-
+    
     int max_iteration_;
     double euclidian_threshold_;
 
     Hessian H_;
     Eigen::Matrix<double, 6, 1> g_;
     double chi_;
-    Eigen::Matrix3d  getRotationMatrix()
+
+    struct LM_param_
+    {
+        double lambda;
+        bool update_j;
+        double increase_factor;
+        double decrease_factor;
+        double tollerance;
+    };
+
+    LM_param_ lm_param;
+    Eigen::Matrix3d  getRotationMatrix(const Eigen::Vector3d &rpy)
     {
         using std::cos, std::sin;
-        // Eigen::AngleAxisd rollAngle(rpy_(0), Eigen::Vector3d::UnitX());
-        // Eigen::AngleAxisd pitchAngle(rpy_(1), Eigen::Vector3d::UnitY());
-        // Eigen::AngleAxisd yawAngle(rpy_(2), Eigen::Vector3d::UnitZ());
-
-        // Eigen::Matrix3d rotationMatrix = (yawAngle * pitchAngle * rollAngle).matrix();
 
         Eigen::Matrix3d rotationMatrix;
-        rotationMatrix << cos(rpy_(1))*cos(rpy_(2)), sin(rpy_(1))*sin(rpy_(0))*cos(rpy_(2)) - sin(rpy_(2))*cos(rpy_(0)), sin(rpy_(1))*cos(rpy_(0))*cos(rpy_(2)) + sin(rpy_(0))*sin(rpy_(2)), 
-                          sin(rpy_(2))*cos(rpy_(1)), sin(rpy_(1))*sin(rpy_(0))*sin(rpy_(2)) + cos(rpy_(0))*cos(rpy_(2)), sin(rpy_(1))*sin(rpy_(2))*cos(rpy_(0)) - sin(rpy_(0))*cos(rpy_(2)), 
-                          -sin(rpy_(1)), sin(rpy_(0))*cos(rpy_(1)), cos(rpy_(1))*cos(rpy_(0));
+        rotationMatrix << cos(rpy(1))*cos(rpy(2)), sin(rpy(1))*sin(rpy(0))*cos(rpy(2)) - sin(rpy(2))*cos(rpy(0)), sin(rpy(1))*cos(rpy(0))*cos(rpy(2)) + sin(rpy(0))*sin(rpy(2)), 
+                          sin(rpy(2))*cos(rpy(1)), sin(rpy(1))*sin(rpy(0))*sin(rpy(2)) + cos(rpy(0))*cos(rpy(2)), sin(rpy(1))*sin(rpy(2))*cos(rpy(0)) - sin(rpy(0))*cos(rpy(2)), 
+                          -sin(rpy(1)), sin(rpy(0))*cos(rpy(1)), cos(rpy(1))*cos(rpy(0));
 
         return rotationMatrix;
     }
 
-    Jacobian getJacobian(const PointT &point)
+    Jacobian getJacobian(const Eigen::Vector3d &rpy, const PointT &point)
     {
         using std::cos, std::sin;
         double x(point.x), y(point.y), z(point.z);
         Jacobian J;
-        J   << y*(sin(rpy_(1))*cos(rpy_(0))*cos(rpy_(2)) + sin(rpy_(0))*sin(rpy_(2))) + z*(-sin(rpy_(1))*sin(rpy_(0))*cos(rpy_(2)) + sin(rpy_(2))*cos(rpy_(0))), -x*sin(rpy_(1))*cos(rpy_(2)) + y*sin(rpy_(0))*cos(rpy_(1))*cos(rpy_(2)) + z*cos(rpy_(1))*cos(rpy_(0))*cos(rpy_(2)), -x*sin(rpy_(2))*cos(rpy_(1)) + y*(-sin(rpy_(1))*sin(rpy_(0))*sin(rpy_(2)) - cos(rpy_(0))*cos(rpy_(2))) + z*(-sin(rpy_(1))*sin(rpy_(2))*cos(rpy_(0)) + sin(rpy_(0))*cos(rpy_(2))), 1.0, 0.0, 0.0,
-               y*(sin(rpy_(1))*sin(rpy_(2))*cos(rpy_(0)) - sin(rpy_(0))*cos(rpy_(2))) + z*(-sin(rpy_(1))*sin(rpy_(0))*sin(rpy_(2)) - cos(rpy_(0))*cos(rpy_(2))), -x*sin(rpy_(1))*sin(rpy_(2)) + y*sin(rpy_(0))*sin(rpy_(2))*cos(rpy_(1)) + z*sin(rpy_(2))*cos(rpy_(1))*cos(rpy_(0)), x*cos(rpy_(1))*cos(rpy_(2)) + y*(sin(rpy_(1))*sin(rpy_(0))*cos(rpy_(2)) - sin(rpy_(2))*cos(rpy_(0))) + z*(sin(rpy_(1))*cos(rpy_(0))*cos(rpy_(2)) + sin(rpy_(0))*sin(rpy_(2))), 0.0, 1.0, 0.0,
-               y*cos(rpy_(1))*cos(rpy_(0)) - z*sin(rpy_(0))*cos(rpy_(1)), -x*cos(rpy_(1)) - y*sin(rpy_(1))*sin(rpy_(0)) - z*sin(rpy_(1))*cos(rpy_(0)), 0.0, 0.0, 0.0, 1.0;
+        J   << y*(sin(rpy(1))*cos(rpy(0))*cos(rpy(2)) + sin(rpy(0))*sin(rpy(2))) + z*(-sin(rpy(1))*sin(rpy(0))*cos(rpy(2)) + sin(rpy(2))*cos(rpy(0))), -x*sin(rpy(1))*cos(rpy(2)) + y*sin(rpy(0))*cos(rpy(1))*cos(rpy(2)) + z*cos(rpy(1))*cos(rpy(0))*cos(rpy(2)), -x*sin(rpy(2))*cos(rpy(1)) + y*(-sin(rpy(1))*sin(rpy(0))*sin(rpy(2)) - cos(rpy(0))*cos(rpy(2))) + z*(-sin(rpy(1))*sin(rpy(2))*cos(rpy(0)) + sin(rpy(0))*cos(rpy(2))), 1.0, 0.0, 0.0,
+               y*(sin(rpy(1))*sin(rpy(2))*cos(rpy(0)) - sin(rpy(0))*cos(rpy(2))) + z*(-sin(rpy(1))*sin(rpy(0))*sin(rpy(2)) - cos(rpy(0))*cos(rpy(2))), -x*sin(rpy(1))*sin(rpy(2)) + y*sin(rpy(0))*sin(rpy(2))*cos(rpy(1)) + z*sin(rpy(2))*cos(rpy(1))*cos(rpy(0)), x*cos(rpy(1))*cos(rpy(2)) + y*(sin(rpy(1))*sin(rpy(0))*cos(rpy(2)) - sin(rpy(2))*cos(rpy(0))) + z*(sin(rpy(1))*cos(rpy(0))*cos(rpy(2)) + sin(rpy(0))*sin(rpy(2))), 0.0, 1.0, 0.0,
+               y*cos(rpy(1))*cos(rpy(0)) - z*sin(rpy(0))*cos(rpy(1)), -x*cos(rpy(1)) - y*sin(rpy(1))*sin(rpy(0)) - z*sin(rpy(1))*cos(rpy(0)), 0.0, 0.0, 0.0, 1.0;
         return J;
     }
 
-    Eigen::Vector3d getError(const PointT &src_point, const PointT &tgt_point)
+    Eigen::Vector3d getError(const Eigen::Vector3d &xyz, const Eigen::Vector3d &rpy, const PointT &src_point, const PointT &tgt_point)
     {
         Eigen::Vector3d p_src, p_tgt;
         p_src<<src_point.x,src_point.y,src_point.z;
         p_tgt<<tgt_point.x,tgt_point.y,tgt_point.z;
-        Eigen::Matrix3d R = getRotationMatrix();
-        return (R*p_src + xyz_) - p_tgt;
+        Eigen::Matrix3d R = getRotationMatrix(rpy);
+        return (R*p_src + xyz) - p_tgt;
     }
 
     Correspondences getCorrespondenceIndices(const pcl::PointCloud<PointT>::Ptr &p, const pcl::PointCloud<PointT>::Ptr &q)
